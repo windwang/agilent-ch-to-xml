@@ -1,0 +1,273 @@
+package chreader;
+
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.nio.file.Path;
+import java.nio.ByteBuffer;
+
+public class SampleGC7890 {
+
+	static private final int OFFSET_SAMPLE_NAME     = 0x35A;
+	static private final int OFFSET_OPERATOR_NAME   = 0x758;
+	static private final int OFFSET_SAMPLE_DATE     = 0x957;
+	static private final int OFFSET_ANALYSIS_METHOD = 0xA0E;
+	static private final int OFFSET_RETENTION_START = 0x11A;
+	static private final int OFFSET_RETENTION_END   = 0x11E;
+	static private final int OFFSET_SAMPLE_DATA     = 0x1800;
+	
+	static private final int MAGIC_NUMBER = 0x03313739;
+	
+	private final class Pair
+	{
+		public double x;
+		public double y;
+		
+		public Pair( double nx, double ny )
+		{
+			x = nx;
+			y = ny;
+		}
+	}
+	
+	private Pair[] samples;
+	private byte[] raw;
+	
+	private double retentionStart;
+	private double retentionEnd;
+	private double frequency;
+	private double sampleStep;
+	private double totalArea;
+	private int sampleSize;
+	private double totalProcessingTimeMs;
+	
+	public String sampleName;
+	private String operatorName;
+	public String sampleDate;
+	public String analysisMethod;
+	private String fileProcessDate;
+	private String originalPath;
+	
+	public boolean good = false;
+	
+	public static boolean isGC7890( String filename )
+	{
+		byte[] buffer = new byte[4];
+		InputStream is;
+		try {
+			is = new FileInputStream(filename);
+			if( is.read(buffer) != buffer.length ) 
+			{
+				is.close();
+				return false;
+			}
+			is.close();
+			
+			int id = ByteBuffer.wrap(buffer).getInt();
+			
+			return id == MAGIC_NUMBER;
+		} catch (Exception e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+			return false;
+		}
+	}
+	
+	public SampleGC7890( String filename )
+	{
+		
+		long startTime = System.nanoTime();
+		
+		Path path = Paths.get(filename);
+		try {
+			raw = Files.readAllBytes(path);
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+			return;
+		}
+		
+		originalPath = filename;
+		
+		retentionStart = (int) read4BFloatBE(OFFSET_RETENTION_START)/60000.0;
+		retentionEnd = (int) read4BFloatBE(OFFSET_RETENTION_END)/60000.0;
+		
+		sampleSize = (raw.length - OFFSET_SAMPLE_DATA)/8;
+		sampleStep = (retentionEnd - retentionStart)/ (float) (sampleSize - 1);
+		frequency = (sampleSize - 1)/((retentionEnd - retentionStart) * 60.0);
+		
+		sampleName = readString(OFFSET_SAMPLE_NAME);
+		operatorName = readString(OFFSET_OPERATOR_NAME);
+		sampleDate = readString(OFFSET_SAMPLE_DATE);
+		analysisMethod = readString(OFFSET_ANALYSIS_METHOD);
+		
+		int formatIdentifier = ByteBuffer.wrap(Arrays.copyOf(raw, 4)).getInt();
+		if( formatIdentifier != MAGIC_NUMBER )
+		{
+			raw = null;
+			return;
+		}
+		
+		samples = new Pair[sampleSize];
+		
+		samples[0] = new Pair( retentionStart, readSampleDataAt(0) );
+		samples[sampleSize - 1] = new Pair( retentionEnd, readSampleDataAt(sampleSize - 1) );
+		
+		totalArea = samples[0].y + samples[sampleSize - 1].y;
+		
+		for( int i = 1; i < sampleSize - 1; i++ )
+		{
+			samples[i] = new Pair( retentionStart + i * sampleStep, readSampleDataAt(i));
+			totalArea += 2.0 * samples[i].y;
+			
+		}
+		
+		totalArea *= sampleStep / 2.0;
+		
+		fileProcessDate = new SimpleDateFormat("MM/dd/yy HH:mm:ss").format(Calendar.getInstance().getTime());
+		
+		good = true;
+		raw = null;
+		
+		long endTime = System.nanoTime();
+		totalProcessingTimeMs = (endTime - startTime) / 1000000.0f;
+	}
+	
+	public void printInfoString()
+	{
+		System.out.format("Sample Name: %s\n", sampleName);
+		System.out.format("Sample Date: %s\n", sampleDate);
+		System.out.format("Analysis Method: %s\n", analysisMethod);
+		System.out.format("Operator Name: %s\n", operatorName);
+		System.out.format("Retention Start: %.15f\n", retentionStart);
+		System.out.format("Retention End: %.15f\n", retentionEnd);
+		System.out.format("Sample Size: %d\n", sampleSize);
+		System.out.format("Sample Time Step: %.15f\n", sampleStep);
+		System.out.format("Sampling Frequency: %.15f\n", frequency);
+		System.out.format("Total Area: %.15f\n", totalArea );
+		System.out.format("Time to Process: %fms (%fms/sample)", totalProcessingTimeMs, totalProcessingTimeMs/(float)sampleSize);
+	}
+	
+	private static String cullZeroes( double value )
+	{
+		String output = String.format("%.15f", value);
+		int newEnd = output.length() - 1;
+		for( ; output.charAt(newEnd) == '0'; newEnd-- );
+		if( output.charAt(newEnd) == '.' ) newEnd--;
+		
+		return output.substring(0, newEnd + 1);
+	}
+	
+	private static <T> String createXmlMetaField( String name, String type, T value )
+	{
+		return String.format("\t\t<field name=\"%s\" value=\"%s\" type=\"%s\"/>\n", name, value.toString(), type);
+	}
+	
+	private static String createXmlMetaField( String name, String value )
+	{
+		return createXmlMetaField(name, "string", value);
+	}
+	
+	private static String createXmlMetaField( String name, double value )
+	{
+		return createXmlMetaField(name, "double", cullZeroes(value));
+	}
+	
+	private static String createXmlMetaField( String name, int value )
+	{
+		return createXmlMetaField(name, "int", value);
+	}
+	
+	private String createXmlSampleField( int position )
+	{
+		return String.format("\t\t<sample x=\"%s\" y=\"%s\"/>\n", cullZeroes(samples[position].x), cullZeroes(samples[position].y));
+	}
+	
+	public void writeXml( String path )
+	{
+		PrintWriter pw;
+		try {
+			pw = new PrintWriter(new FileWriter(path));
+		} catch (IOException e1) {
+			// TODO Auto-generated catch block
+			e1.printStackTrace();
+			return;
+		}
+		pw.write( "<?xml version=\"1.0\" encoding=\"ASCII\" standalone=\"yes\"?>\n<run>\n\t<meta>\n" );
+		pw.write( createXmlMetaField( "sampleName", sampleName ));
+		pw.write( createXmlMetaField( "operatorName", operatorName ));
+		pw.write( createXmlMetaField( "sampleDate", sampleDate ));
+		pw.write( createXmlMetaField( "analysisMethod", analysisMethod ));
+		pw.write( createXmlMetaField( "fileProcessDate", fileProcessDate ));
+		pw.write( createXmlMetaField( "originalPath", originalPath ));
+		pw.write( createXmlMetaField( "totalProcessingTimeMs", totalProcessingTimeMs ));
+		
+		pw.write( createXmlMetaField( "sampleSize", sampleSize ));
+		pw.write( createXmlMetaField( "retentionStart", retentionStart ));
+		pw.write( createXmlMetaField( "retentionEnd", retentionEnd ));
+		pw.write( createXmlMetaField( "frequency", frequency ));
+		pw.write( createXmlMetaField( "sampleStep", sampleStep ));
+		pw.write( createXmlMetaField( "totalArea", totalArea ));
+		
+		pw.write( "\t</meta>\n\t<samples>\n");
+		
+		for( int i = 0; i < sampleSize; i++ )
+			pw.write( createXmlSampleField(i));
+		
+		pw.write( "\t</samples>\n</run>");
+		
+		pw.close();
+	}
+	
+	private float readSampleDataAt( int position )
+	{
+		int offset = OFFSET_SAMPLE_DATA + position * 8;
+		
+		byte[] rev = new byte[8];
+		
+		for( int i = 7; i > 0; i-- )
+		{
+			rev[7 - i] = raw[offset + i];
+		}
+		
+		rev[0] &= 0x7F;
+		
+		return (float) ByteBuffer.wrap(rev).getDouble();
+	}
+	
+	private String readString( int position )
+	{
+		int length = raw[position];
+		String ret = "";
+		
+		for( int i = 0; i < length; i++ )
+			ret += (char) raw[position + 1 + i * 2 ];
+		
+		return ret;
+	}
+	
+	private float read4BFloatBE(int pos)
+	{
+		byte[] tmp = new byte[4];
+		for( int i = 0; i < 4; i++ )
+			tmp[i] = raw[pos + i];
+		
+		 long result = 0L;
+		    int shift = (4 - 1) * 8;
+		    for (int i = 0; i < 4; i++)
+		    {
+		      result |= (tmp[i] & 0xFF) << shift;
+		      shift -= 8;
+		    }
+		    
+		return Float.intBitsToFloat((int) result);
+	}
+}
